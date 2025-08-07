@@ -1,0 +1,82 @@
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+
+import java.util.*;
+
+public class RelationshipBuilderJackson {
+
+    public static void main(String[] args) throws Exception {
+        String sourceJson = """
+            {
+                "count": 3,
+                "value": [
+                    {"id":"1234", "value":"parent", "state":"done"},
+                    {"id":"1235", "value":"child1", "state":"done"},
+                    {"id":"1236", "value":"child2", "state":"done"},
+                    {"id":"1237", "value":"parent", "state":"done"},
+                    {"id":"2235", "value":"child1", "state":"done"},
+                    {"id":"2236", "value":"child2", "state":"done"},
+                    {"id":"2237", "value":"child3", "state":"done"}
+                ]
+            }
+        """;
+
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode root = mapper.readTree(sourceJson);
+        ArrayNode allItems = (ArrayNode) root.get("value");
+
+        // Step 1: Build id -> item map
+        Map<String, ObjectNode> itemMap = new HashMap<>();
+        for (JsonNode node : allItems) {
+            itemMap.put(node.get("id").asText(), (ObjectNode) node);
+        }
+
+        // Step 2: Simulate RelationHashMap
+        Map<String, Map<String, List<String>>> relationMap = new HashMap<>();
+
+        // For 1234
+        relationMap.put("1234", Map.of(
+                "related", List.of("1235", "1236")
+        ));
+
+        // For 1237
+        Map<String, List<String>> rel1237 = new HashMap<>();
+        rel1237.put("Hirerachy-Reverse", new ArrayList<>(List.of("2235", "2237")));
+        rel1237.put("related", new ArrayList<>(List.of("2236")));
+        relationMap.put("1237", rel1237);
+
+        // Step 3: Build releaseItems array
+        ArrayNode releaseItems = mapper.createArrayNode();
+
+        for (String parentId : relationMap.keySet()) {
+            ObjectNode parentCopy = itemMap.get(parentId).deepCopy();
+            ObjectNode relationshipsNode = mapper.createObjectNode();
+
+            for (Map.Entry<String, List<String>> entry : relationMap.get(parentId).entrySet()) {
+                String relType = entry.getKey();
+                ArrayNode relChildren = mapper.createArrayNode();
+
+                for (String childId : entry.getValue()) {
+                    ObjectNode child = itemMap.get(childId);
+                    if (child != null) {
+                        relChildren.add(child);
+                    }
+                }
+
+                relationshipsNode.set(relType, relChildren);
+            }
+
+            parentCopy.set("relationShips", relationshipsNode);
+            releaseItems.add(parentCopy);
+        }
+
+        // Step 4: Wrap into final object
+        ObjectNode finalJson = mapper.createObjectNode();
+        finalJson.set("releaseItems", releaseItems);
+
+        // Pretty print result
+        System.out.println(mapper.writerWithDefaultPrettyPrinter().writeValueAsString(finalJson));
+    }
+}
