@@ -1,152 +1,90 @@
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import org.apache.http.HttpResponse;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.entity.StringEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
-import org.apache.http.impl.client.HttpClients;
 
 import java.io.FileWriter;
-import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.*;
+import java.util.stream.Collectors;
 
 public class AdoInitiativeReportOrgWide {
 
-    private static final String ORG_URL = "https://dev.azure.com/YOURORG";
-    private static final String PAT = "YOUR_PERSONAL_ACCESS_TOKEN";
-    private static final ObjectMapper mapper = new ObjectMapper();
+    // === CONFIG ===
+    private static final String ORG_URL = "https://dev.azure.com/{your_org}"; // replace
+    private static final String PAT = "{your_pat}";                           // replace
+
+    // Tunables
+    private static final int INITIATIVE_PAGE_SIZE = 500;
+    private static final int INITIATIVE_BATCH_SIZE = 200;
+    private static final int WORKITEM_BATCH_SIZE = 200;
+    private static final int SLEEP_MS_BETWEEN_HEAVY_CALLS = 200;
+
+    private static final HttpClient CLIENT = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(30))
+            .build();
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     public static void main(String[] args) throws Exception {
-        List<Integer> initiativeIds = fetchAllInitiatives();
+        List<String> projects = fetchProjects();
+        System.out.println("Projects found: " + projects.size());
 
-        // adjacency map (parent → children)
-        Map<Integer, Set<Integer>> adjacency = new HashMap<>();
-        Map<Integer, WorkItem> details = new HashMap<>();
-
-        // fetch hierarchy for all initiatives
-        for (int initId : initiativeIds) {
-            fetchHierarchy(initId, adjacency);
-        }
-
-        // fetch details for all collected IDs
-        Set<Integer> allIds = new HashSet<>();
-        allIds.addAll(initiativeIds);
-        adjacency.values().forEach(allIds::addAll);
-        fetchWorkItemDetails(new ArrayList<>(allIds), details);
-
-        // traverse and collect report rows
         List<ReportRow> reportRows = new ArrayList<>();
-        for (int initId : initiativeIds) {
-            traverseAndAddRows(initId, adjacency, details, reportRows, 0, initId);
-        }
 
-        // write CSV
-        writeCsv(reportRows);
-        System.out.println("Report generated: initiative_hierarchy_report.csv");
-    }
+        for (String project : projects) {
+            System.out.println("\n=== Processing project: " + project + " ===");
+            int lastInitiativeId = 0;
+            int pageNum = 1;
 
-    // ----------------- Fetch Initiatives -----------------
-    private static List<Integer> fetchAllInitiatives() throws Exception {
-        List<Integer> ids = new ArrayList<>();
-        int skip = 0, batch = 200;
-        boolean hasMore = true;
-
-        while (hasMore) {
-            String wiql = "{ \"query\": \"SELECT [System.Id] FROM WorkItems WHERE [System.WorkItemType] = 'Initiative' ORDER BY [System.Id] ASC\" }";
-            List<Integer> batchIds = runWiql(wiql, skip, batch);
-            if (batchIds.isEmpty()) {
-                hasMore = false;
-            } else {
-                ids.addAll(batchIds);
-                skip += batch;
-            }
-        }
-        return ids;
-    }
-
-    private static List<Integer> runWiql(String wiql, int skip, int top) throws Exception {
-        List<Integer> ids = new ArrayList<>();
-        String url = ORG_URL + "/_apis/wit/wiql?api-version=7.0&$skip=" + skip + "&$top=" + top;
-        JsonNode json = postJson(url, wiql);
-        for (JsonNode item : json.get("workItems")) {
-            ids.add(item.get("id").asInt());
-        }
-        return ids;
-    }
-
-    // ----------------- Fetch Hierarchy Links -----------------
-    private static void fetchHierarchy(int rootId, Map<Integer, Set<Integer>> adjacency) throws Exception {
-        String url = ORG_URL + "/_apis/wit/workitems/" + rootId + "?$expand=relations&api-version=7.0";
-        JsonNode json = getJson(url);
-
-        if (json.has("relations")) {
-            for (JsonNode rel : json.get("relations")) {
-                if (rel.get("rel").asText().equals("System.LinkTypes.Hierarchy-Forward")) {
-                    String urlRef = rel.get("url").asText();
-                    int childId = Integer.parseInt(urlRef.substring(urlRef.lastIndexOf("/") + 1));
-                    adjacency.computeIfAbsent(rootId, k -> new HashSet<>()).add(childId);
-                    // recurse to build deeper hierarchy
-                    fetchHierarchy(childId, adjacency);
+            while (true) {
+                // 1) Page initiatives using keyset pagination
+                List<Integer> initiatives = fetchInitiativesPage(project, lastInitiativeId, INITIATIVE_PAGE_SIZE);
+                if (initiatives.isEmpty()) {
+                    System.out.println("  No more initiatives for project: " + project);
+                    break;
                 }
+                System.out.printf("  Page %d: fetched %d initiatives (ids %d..%d)%n",
+                        pageNum++, initiatives.size(),
+                        initiatives.get(0), initiatives.get(initiatives.size() - 1));
+
+                // 2) Process initiatives in batches to expand hierarchies
+                for (int i = 0; i < initiatives.size(); i += INITIATIVE_BATCH_SIZE) {
+                    List<Integer> batch = initiatives.subList(i, Math.min(i + INITIATIVE_BATCH_SIZE, initiatives.size()));
+                    System.out.printf("    Expanding batch %d..%d (size=%d)%n", batch.get(0), batch.get(batch.size() - 1), batch.size());
+
+                    // Expand hierarchies for this batch
+                    Map<Integer, Set<Integer>> adjacency = fetchHierarchiesForInitiatives(project, batch);
+
+                    // Collect all involved IDs
+                    Set<Integer> allIds = new HashSet<>(batch);
+                    adjacency.values().forEach(allIds::addAll);
+
+                    // 3) Enrich details
+                    Map<Integer, WorkItem> details = fetchWorkItemsBatch(allIds);
+
+                    // 4) Traverse and build rows
+                    for (int initiativeId : batch) {
+                        traverseAndAddRows(
+                                initiativeId,
+                                adjacency,
+                                details,
+                                reportRows,
+                                0, // start depth = 0
+                                initiativeId
+                        );
+                    }
+                    Thread.sleep(SLEEP_MS_BETWEEN_HEAVY_CALLS);
+                }
+
+                lastInitiativeId = initiatives.get(initiatives.size() - 1);
             }
         }
-    }
 
-    // ----------------- Fetch Work Item Details -----------------
-    private static void fetchWorkItemDetails(List<Integer> ids, Map<Integer, WorkItem> details) throws Exception {
-        int batch = 200;
-        for (int i = 0; i < ids.size(); i += batch) {
-            List<Integer> sub = ids.subList(i, Math.min(i + batch, ids.size()));
-            String idStr = String.join(",", sub.stream().map(Object::toString).toArray(String[]::new));
-            String url = ORG_URL + "/_apis/wit/workitems?ids=" + idStr + "&api-version=7.0";
-            JsonNode json = getJson(url);
-
-            for (JsonNode wi : json.get("value")) {
-                WorkItem item = new WorkItem();
-                item.id = wi.get("id").asInt();
-                JsonNode f = wi.get("fields");
-                item.projectName = f.path("System.TeamProject").asText("");
-                item.areaPath = f.path("System.AreaPath").asText("");
-                item.type = f.path("System.WorkItemType").asText("");
-                item.assignedTo = f.path("System.AssignedTo").path("displayName").asText("");
-                item.createdBy = f.path("System.CreatedBy").path("displayName").asText("");
-                details.put(item.id, item);
-            }
-        }
-    }
-
-    // ----------------- Traverse + Build Report -----------------
-    private static void traverseAndAddRows(
-            int parentId,
-            Map<Integer, Set<Integer>> adjacency,
-            Map<Integer, WorkItem> details,
-            List<ReportRow> reportRows,
-            int depth,
-            int initiativeId
-    ) {
-        WorkItem wi = details.get(parentId);
-        if (wi != null) {
-            ReportRow row = new ReportRow();
-            row.projectName = wi.projectName;
-            row.areaPath = wi.areaPath;
-            row.type = wi.type;
-            row.initiativeId = initiativeId;
-            row.workItemId = wi.id;
-            row.assignedTo = wi.assignedTo;
-            row.createdBy = wi.createdBy;
-            row.depth = depth;
-            reportRows.add(row);
-        }
-
-        for (int childId : adjacency.getOrDefault(parentId, Collections.emptySet())) {
-            traverseAndAddRows(childId, adjacency, details, reportRows, depth + 1, initiativeId);
-        }
-    }
-
-    // ----------------- Write CSV -----------------
-    private static void writeCsv(List<ReportRow> reportRows) throws IOException {
-        try (FileWriter fw = new FileWriter("initiative_hierarchy_report.csv", StandardCharsets.UTF_8)) {
+        // Write CSV final
+        try (FileWriter fw = new FileWriter("initiative_report_orgwide.csv", StandardCharsets.UTF_8)) {
             fw.write("ProjectName,AreaPath,WorkitemType,InitiativeID,WorkitemID,Assignee,Reporter,HierarchyLevel\n");
             for (ReportRow r : reportRows) {
                 fw.write(String.format("\"%s\",\"%s\",\"%s\",%d,%d,\"%s\",\"%s\",%d\n",
@@ -161,41 +99,200 @@ public class AdoInitiativeReportOrgWide {
                 ));
             }
         }
+        System.out.println("\n✅ Done. CSV: initiative_report_orgwide.csv (rows=" + reportRows.size() + ")");
     }
 
-    private static String safe(String s) {
-        return s == null ? "" : s.replace("\"", "'");
-    }
+    // ---------- Recursive traversal ----------
+    private static void traverseAndAddRows(
+            int currentId,
+            Map<Integer, Set<Integer>> adjacency,
+            Map<Integer, WorkItem> details,
+            List<ReportRow> reportRows,
+            int depth,
+            int initiativeId
+    ) {
+        WorkItem wi = details.get(currentId);
+        if (wi != null) {
+            ReportRow row = new ReportRow();
+            row.projectName = wi.projectName;
+            row.areaPath = wi.areaPath;
+            row.type = wi.type;
+            row.initiativeId = initiativeId;
+            row.workItemId = wi.id;
+            row.assignedTo = wi.assignedTo;
+            row.createdBy = wi.createdBy;
+            row.depth = depth;
+            reportRows.add(row);
+        }
 
-    // ----------------- HTTP Helpers -----------------
-    private static JsonNode getJson(String url) throws Exception {
-        try (CloseableHttpClient client = HttpClients.createDefault()) {
-            HttpGet req = new HttpGet(url);
-            req.addHeader("Authorization", "Basic " +
-                    Base64.getEncoder().encodeToString((":" + PAT).getBytes(StandardCharsets.UTF_8)));
-            HttpResponse res = client.execute(req);
-            return mapper.readTree(res.getEntity().getContent());
+        for (int childId : adjacency.getOrDefault(currentId, Collections.emptySet())) {
+            traverseAndAddRows(childId, adjacency, details, reportRows, depth + 1, initiativeId);
         }
     }
 
-    private static JsonNode postJson(String url, String body) throws Exception {
-        try (CloseableHttpClient client = HttpClients.createDefault()) {
-            org.apache.http.client.methods.HttpPost req = new org.apache.http.client.methods.HttpPost(url);
-            req.addHeader("Content-Type", "application/json");
-            req.addHeader("Authorization", "Basic " +
-                    Base64.getEncoder().encodeToString((":" + PAT).getBytes(StandardCharsets.UTF_8)));
-            req.setEntity(new StringEntity(body, StandardCharsets.UTF_8));
-            HttpResponse res = client.execute(req);
-            return mapper.readTree(res.getEntity().getContent());
+    // ---------- HTTP helper & auth ----------
+    private static String authHeader() {
+        return "Basic " + Base64.getEncoder().encodeToString((":" + PAT).getBytes(StandardCharsets.UTF_8));
+    }
+
+    // ---------- 1) Projects ----------
+    private static List<String> fetchProjects() throws Exception {
+        String url = ORG_URL + "/_apis/projects?api-version=7.0";
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", authHeader())
+                .timeout(Duration.ofSeconds(60))
+                .GET()
+                .build();
+        HttpResponse<String> resp = CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+        checkStatus(resp);
+        JsonNode arr = MAPPER.readTree(resp.body()).path("value");
+        List<String> projects = new ArrayList<>();
+        for (JsonNode n : arr) {
+            projects.add(n.path("name").asText());
+        }
+        return projects;
+    }
+
+    // ---------- 2) Initiatives paging ----------
+    private static List<Integer> fetchInitiativesPage(String project, int lastIdExclusive, int pageSize) throws Exception {
+        String where = "WHERE [System.WorkItemType] = 'Initiative'";
+        if (lastIdExclusive > 0) where += " AND [System.Id] > " + lastIdExclusive;
+
+        String wiql = "{ \"query\": \"SELECT [System.Id] FROM WorkItems " +
+                where +
+                " ORDER BY [System.Id] ASC\" }";
+
+        String url = ORG_URL + "/" + encode(project) + "/_apis/wit/wiql?api-version=7.0";
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", authHeader())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(wiql))
+                .timeout(Duration.ofSeconds(120))
+                .build();
+
+        HttpResponse<String> resp = CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+        checkStatus(resp);
+
+        JsonNode arr = MAPPER.readTree(resp.body()).path("workItems");
+        List<Integer> ids = new ArrayList<>();
+        for (JsonNode n : arr) ids.add(n.path("id").asInt());
+
+        if (ids.size() > pageSize) return ids.subList(0, pageSize);
+        return ids;
+    }
+
+    // ---------- 3) Expand hierarchies ----------
+    private static Map<Integer, Set<Integer>> fetchHierarchiesForInitiatives(String project, List<Integer> initiativeIds) throws Exception {
+        if (initiativeIds.isEmpty()) return Collections.emptyMap();
+
+        String idList = initiativeIds.stream().map(String::valueOf).collect(Collectors.joining(","));
+        String wiql = "{ \"query\": \"SELECT [System.Id] FROM WorkItemLinks " +
+                "WHERE [Source].[System.Id] IN (" + idList + ") " +
+                "AND [System.Links.LinkType] = 'System.LinkTypes.Hierarchy-Forward' " +
+                "ORDER BY [System.Id] MODE (Recursive)\" }";
+
+        String url = ORG_URL + "/" + encode(project) + "/_apis/wit/wiql?api-version=7.0";
+        HttpRequest req = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", authHeader())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(wiql))
+                .timeout(Duration.ofMinutes(3))
+                .build();
+
+        HttpResponse<String> resp = CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+        checkStatus(resp);
+
+        JsonNode rels = MAPPER.readTree(resp.body()).path("workItemRelations");
+
+        Map<Integer, Set<Integer>> map = new HashMap<>();
+        for (JsonNode rel : rels) {
+            if (rel.has("source") && rel.has("target")) {
+                int source = rel.path("source").path("id").asInt();
+                int target = rel.path("target").path("id").asInt();
+                map.computeIfAbsent(source, k -> new HashSet<>()).add(target);
+            }
+        }
+        for (Integer id : initiativeIds) map.putIfAbsent(id, Collections.emptySet());
+
+        return map;
+    }
+
+    // ---------- 4) Batch fetch work item details ----------
+    private static Map<Integer, WorkItem> fetchWorkItemsBatch(Set<Integer> ids) throws Exception {
+        Map<Integer, WorkItem> result = new HashMap<>();
+        List<Integer> idList = new ArrayList<>(ids);
+        for (int i = 0; i < idList.size(); i += WORKITEM_BATCH_SIZE) {
+            List<Integer> batch = idList.subList(i, Math.min(i + WORKITEM_BATCH_SIZE, idList.size()));
+            String url = ORG_URL + "/_apis/wit/workitemsbatch?api-version=7.0";
+
+            Map<String, Object> bodyObj = new HashMap<>();
+            bodyObj.put("ids", batch);
+            bodyObj.put("fields", List.of(
+                    "System.Id",
+                    "System.Title",
+                    "System.WorkItemType",
+                    "System.TeamProject",
+                    "System.AreaPath",
+                    "System.AssignedTo",
+                    "System.CreatedBy"
+            ));
+
+            String body = MAPPER.writeValueAsString(bodyObj);
+
+            HttpRequest req = HttpRequest.newBuilder()
+                    .uri(URI.create(url))
+                    .header("Authorization", authHeader())
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .timeout(Duration.ofMinutes(2))
+                    .build();
+
+            HttpResponse<String> resp = CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
+            checkStatus(resp);
+
+            JsonNode arr = MAPPER.readTree(resp.body()).path("value");
+            for (JsonNode wi : arr) {
+                WorkItem w = new WorkItem();
+                w.id = wi.path("id").asInt();
+                w.title = wi.at("/fields/System.Title").asText("");
+                w.type = wi.at("/fields/System.WorkItemType").asText("");
+                w.projectName = wi.at("/fields/System.TeamProject").asText("");
+                w.areaPath = wi.at("/fields/System.AreaPath").asText("");
+                JsonNode at = wi.at("/fields/System.AssignedTo");
+                w.assignedTo = at.isObject() ? at.path("displayName").asText("") : at.asText("");
+                JsonNode cb = wi.at("/fields/System.CreatedBy");
+                w.createdBy = cb.isObject() ? cb.path("displayName").asText("") : cb.asText("");
+                result.put(w.id, w);
+            }
+            Thread.sleep(SLEEP_MS_BETWEEN_HEAVY_CALLS);
+        }
+        return result;
+    }
+
+    // ---------- Helpers ----------
+    private static void checkStatus(HttpResponse<?> resp) {
+        int c = resp.statusCode();
+        if (c < 200 || c >= 300) {
+            throw new RuntimeException("HTTP " + c + " -> " + String.valueOf(resp.body()));
         }
     }
 
-    // ----------------- Models -----------------
+    private static String safe(String s) { return s == null ? "" : s.replace("\"", "\"\""); }
+
+    private static String encode(String s) {
+        return s.replace(" ", "%20");
+    }
+
+    // ---------- POJOs ----------
     static class WorkItem {
         int id;
+        String title;
+        String type;
         String projectName;
         String areaPath;
-        String type;
         String assignedTo;
         String createdBy;
     }
@@ -204,4 +301,10 @@ public class AdoInitiativeReportOrgWide {
         String projectName;
         String areaPath;
         String type;
-        int initiative
+        int initiativeId;
+        int workItemId;
+        String assignedTo;
+        String createdBy;
+        int depth; // NEW → hierarchy level
+    }
+}
