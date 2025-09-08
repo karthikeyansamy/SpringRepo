@@ -7,12 +7,13 @@ import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.OffsetDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Objects;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -24,54 +25,23 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 
-/**
- * WorkItemFetcher
- *
- * Features:
- * 1) Reads WorkItem IDs from Oracle DB in batches (configurable batchSize)
- * 2) Calls ADO REST endpoint in batch (configurable adoBatchSize) and in parallel using an ExecutorService
- * 3) Parses response and extracts fields: WorkItem ID, WorkItem Type, AssignedTo, CreatedBy, ChangedDate, CreatedDate, State
- * 4) Inserts/Upserts results back into Oracle table using MERGE (batch)
- *
- * Dependencies:
- * - Java 11+ (for HttpClient)
- * - com.fasterxml.jackson.core:jackson-databind
- * - Oracle JDBC driver on classpath
- *
- * Notes:
- * - Tune DB_BATCH_SIZE, ADO_BATCH_SIZE and THREAD_POOL_SIZE according to available resources
- * - ADO API shape is assumed to accept a JSON array of ids and return JSON array of work item objects; adjust request/response handling to match your API
- */
 public class WorkItemFetcher {
 
-    // ---------- CONFIGURATION ----------
     private static final String DB_URL = "jdbc:oracle:thin:@//dbhost:1521/ORCLPDB1";
     private static final String DB_USER = "your_db_user";
     private static final String DB_PASSWORD = "your_db_password";
 
-    // Table where results will be stored - adjust column names/types accordingly
     private static final String TARGET_TABLE = "WORKITEM_SUMMARY";
 
-    // How many IDs to fetch from Oracle per cycle (reading large table in chunks)
     private static final int DB_BATCH_SIZE = 5000;
-
-    // How many workitem IDs to pass to ADO in one API call
     private static final int ADO_BATCH_SIZE = 200;
-
-    // Number of concurrent threads to call ADO in parallel
     private static final int THREAD_POOL_SIZE = 8;
 
-    // ADO endpoint and auth (update for your environment). Example: https://dev.azure.com/{org}/_apis/wit/workitemsbatch?api-version=6.0
     private static final String ADO_ENDPOINT = "https://dev.azure.com/yourOrg/_apis/wit/workitemsbatch?api-version=6.0";
-    private static final String ADO_PERSONAL_ACCESS_TOKEN = "REPLACE_WITH_PAT"; // Basic auth using PAT as username:password (username empty)
+    private static final String ADO_PERSONAL_ACCESS_TOKEN = "REPLACE_WITH_PAT";
 
-    // How long to wait for threads to finish (minutes)
     private static final long SHUTDOWN_WAIT_MINUTES = 30;
-
-    // Retry attempts for HTTP calls
     private static final int HTTP_MAX_RETRIES = 2;
-
-    // ---------- END CONFIG ----------
 
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
@@ -93,17 +63,16 @@ public class WorkItemFetcher {
         try (Connection conn = DriverManager.getConnection(DB_URL, DB_USER, DB_PASSWORD)) {
             conn.setAutoCommit(false);
 
-            long offset = 0;
+            long lastId = 0;
             boolean more = true;
 
             while (more) {
-                List<Long> ids = fetchIdBatch(conn, offset, DB_BATCH_SIZE);
+                List<Long> ids = fetchIdBatch(conn, lastId, DB_BATCH_SIZE);
                 if (ids.isEmpty()) {
                     more = false;
                     break;
                 }
 
-                // Partition into ADO_BATCH_SIZE chunks
                 List<List<Long>> partitions = partition(ids, ADO_BATCH_SIZE);
 
                 List<Future<Integer>> futures = new ArrayList<>();
@@ -112,18 +81,16 @@ public class WorkItemFetcher {
                     futures.add(executor.submit(task));
                 }
 
-                // Wait for tasks and collect results
                 for (Future<Integer> f : futures) {
                     try {
-                        f.get(); // you can log returned count
+                        f.get();
                     } catch (ExecutionException ee) {
                         System.err.println("Task failed: " + ee.getCause());
                     }
                 }
 
-                offset += ids.size();
+                lastId = ids.get(ids.size() - 1);
 
-                // continue loop until fewer than batchSize returned
                 if (ids.size() < DB_BATCH_SIZE) {
                     more = false;
                 }
@@ -135,30 +102,22 @@ public class WorkItemFetcher {
         }
     }
 
-    /**
-     * Fetches a batch of WorkItem IDs using OFFSET/FETCH NEXT. Adjust SQL if your Oracle version requires different pagination.
-     */
-    private List<Long> fetchIdBatch(Connection conn, long offset, int batchSize) throws SQLException {
-        String sql = "SELECT WORKITEM_ID FROM (SELECT WORKITEM_ID, ROW_NUMBER() OVER (ORDER BY WORKITEM_ID) rn FROM SOURCE_WORKITEM_TABLE) WHERE rn > ? AND rn <= ?";
+    private List<Long> fetchIdBatch(Connection conn, long lastId, int batchSize) throws SQLException {
+        String sql = "SELECT WORKITEM_ID FROM SOURCE_WORKITEM_TABLE WHERE WORKITEM_ID > ? ORDER BY WORKITEM_ID FETCH FIRST ? ROWS ONLY";
         List<Long> ids = new ArrayList<>(batchSize);
-        long low = offset;
-        long high = offset + batchSize;
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setLong(1, low);
-            ps.setLong(2, high);
+            ps.setLong(1, lastId);
+            ps.setInt(2, batchSize);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
                     ids.add(rs.getLong("WORKITEM_ID"));
                 }
             }
         }
-        System.out.println("Fetched " + ids.size() + " ids (offset=" + offset + ")");
+        System.out.println("Fetched " + ids.size() + " ids (lastId=" + lastId + ")");
         return ids;
     }
 
-    /**
-     * Main worker: call ADO to get details for the given list of IDs, parse, and insert back into Oracle.
-     */
     private int processAdoBatchAndInsert(List<Long> ids) throws Exception {
         if (ids.isEmpty()) return 0;
         String requestBody = buildAdoRequestBody(ids);
@@ -176,23 +135,12 @@ public class WorkItemFetcher {
             return 0;
         }
 
-        // insert/upsert into DB
         int inserted = upsertWorkItems(records);
         System.out.println("Upserted " + inserted + " records for batch starting with " + ids.get(0));
         return inserted;
     }
 
     private String buildAdoRequestBody(List<Long> ids) throws Exception {
-        // Adapt this JSON payload to match the ADO API you use. Example for workitemsbatch API
-        // {
-        //   "ids": [1,2,3],
-        //   "fields": ["System.Id","System.WorkItemType","System.AssignedTo","System.CreatedBy","System.ChangedDate","System.CreatedDate","System.State"]
-        // }
-        ArrayNode root = objectMapper.createArrayNode();
-        // Using a simple structure: { "ids": [...], "fields": [...] }
-        JsonNode wrapper = objectMapper.createObjectNode()
-                .putPOJO("ids", ids);
-        // but putPOJO will produce an array — to be explicit build
         StringBuilder sb = new StringBuilder();
         sb.append('{');
         sb.append("\"ids\":");
@@ -236,7 +184,7 @@ public class WorkItemFetcher {
                 System.err.println("ADO call failed on attempt " + attempt + ": " + e.getMessage());
             }
             attempt++;
-            Thread.sleep(1000L * attempt); // exponential-ish backoff
+            Thread.sleep(1000L * attempt);
         }
         return null;
     }
@@ -245,7 +193,6 @@ public class WorkItemFetcher {
         List<WorkItemRecord> out = new ArrayList<>();
         JsonNode root = objectMapper.readTree(responseBody);
 
-        // Adjust this based on actual ADO response JSON shape. Here we assume a top-level 'value' array or direct array
         JsonNode listNode = root.has("value") ? root.get("value") : root;
         if (listNode == null || !listNode.isArray()) {
             return Collections.emptyList();
@@ -253,7 +200,6 @@ public class WorkItemFetcher {
 
         for (JsonNode node : listNode) {
             try {
-                // The ADO work item JSON usually has 'id' and 'fields' map
                 long id = node.path("id").asLong();
                 JsonNode fields = node.path("fields");
                 String workItemType = fields.path("System.WorkItemType").asText(null);
@@ -280,9 +226,6 @@ public class WorkItemFetcher {
         return personNode.toString();
     }
 
-    /**
-     * Upserts the parsed workitems into Oracle. Uses MERGE statement for upsert. Each thread opens its own connection.
-     */
     private int upsertWorkItems(List<WorkItemRecord> records) throws SQLException {
         String mergeSql = "MERGE INTO " + TARGET_TABLE + " t USING (SELECT ? AS workitem_id, ? AS workitem_type, ? AS assigned_to, ? AS created_by, ? AS changed_date, ? AS created_date, ? AS state FROM dual) src "
                 + "ON (t.workitem_id = src.workitem_id) "
@@ -298,8 +241,8 @@ public class WorkItemFetcher {
                     ps.setString(2, r.workitemType);
                     ps.setString(3, r.assignedTo);
                     ps.setString(4, r.createdBy);
-                    ps.setString(5, r.changedDate);
-                    ps.setString(6, r.createdDate);
+                    ps.setTimestamp(5, parseIsoToTimestamp(r.changedDate));
+                    ps.setTimestamp(6, parseIsoToTimestamp(r.createdDate));
                     ps.setString(7, r.state);
                     ps.addBatch();
                     count++;
@@ -317,6 +260,19 @@ public class WorkItemFetcher {
         }
     }
 
+    private Timestamp parseIsoToTimestamp(String isoDate) {
+        if (isoDate == null || isoDate.isBlank()) {
+            return null;
+        }
+        try {
+            OffsetDateTime odt = OffsetDateTime.parse(isoDate, DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+            return Timestamp.from(odt.toInstant());
+        } catch (Exception e) {
+            System.err.println("Failed to parse date: " + isoDate + " (" + e.getMessage() + ")");
+            return null;
+        }
+    }
+
     private static <T> List<List<T>> partition(List<T> list, int size) {
         List<List<T>> parts = new ArrayList<>();
         int n = list.size();
@@ -326,7 +282,6 @@ public class WorkItemFetcher {
         return parts;
     }
 
-    // Simple holder for required fields
     static class WorkItemRecord {
         final long workitemId;
         final String workitemType;
