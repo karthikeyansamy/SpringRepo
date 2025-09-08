@@ -14,3 +14,16 @@ CREATE INDEX idx_workitem_summary_state
 
 CREATE INDEX idx_workitem_summary_assigned 
     ON WORKITEM_SUMMARY(assigned_to);
+
+private Timestamp parseIsoToTimestamp(String isoDate) {
+    if (isoDate == null || isoDate.isBlank()) {
+        return null;
+    }
+    try {
+        OffsetDateTime odt = OffsetDateTime.parse(isoDate, DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+        return Timestamp.from(odt.toInstant());
+    } catch (Exception e) {
+        System.err.println("Failed to parse date: " + isoDate + " (" + e.getMessage() + ")");
+        return null;
+    }
+}
