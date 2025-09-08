@@ -1,0 +1,16 @@
+CREATE TABLE WORKITEM_SUMMARY (
+    workitem_id     NUMBER(20)        PRIMARY KEY,
+    workitem_type   VARCHAR2(100),
+    assigned_to     VARCHAR2(255),
+    created_by      VARCHAR2(255),
+    changed_date    TIMESTAMP WITH TIME ZONE,
+    created_date    TIMESTAMP WITH TIME ZONE,
+    state           VARCHAR2(50)
+);
+
+-- Optional index for faster queries on state/assigned_to
+CREATE INDEX idx_workitem_summary_state 
+    ON WORKITEM_SUMMARY(state);
+
+CREATE INDEX idx_workitem_summary_assigned 
+    ON WORKITEM_SUMMARY(assigned_to);
