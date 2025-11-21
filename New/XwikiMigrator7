@@ -1,0 +1,87 @@
+import org.apache.http.HttpResponse;
+import org.apache.http.auth.AuthScope;
+import org.apache.http.auth.UsernamePasswordCredentials;
+import org.apache.http.client.CredentialsProvider;
+import org.apache.http.client.methods.HttpGet;
+import org.apache.http.client.methods.HttpPost;
+import org.apache.http.entity.mime.MultipartEntityBuilder;
+import org.apache.http.entity.ContentType;
+import org.apache.http.impl.client.BasicCredentialsProvider;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
+
+import java.io.File;
+
+public class XwikiImporter {
+
+    private final String baseUrl;
+    private final String user;
+    private final String pass;
+
+    public XwikiImporter(String baseUrl, String user, String pass) {
+        this.baseUrl = baseUrl;
+        this.user = user;
+        this.pass = pass;
+    }
+
+    public void importConfluenceZip(String wiki, String space, String localZipPath) throws Exception {
+
+        CloseableHttpClient client = getClient();
+
+        // 1) Get form token
+        String token = fetchFormToken(client);
+        System.out.println("Form token = " + token);
+
+        // 2) Trigger filter stream import
+        String importUrl = baseUrl + "/bin/filter/import";
+
+        HttpPost post = new HttpPost(importUrl);
+
+        File zipFile = new File(localZipPath);
+        if (!zipFile.exists()) throw new RuntimeException("File not found: " + localZipPath);
+
+        MultipartEntityBuilder builder = MultipartEntityBuilder.create();
+
+        builder.addTextBody("form_token", token);
+        builder.addTextBody("inputSyntax", "confluence+xml");
+        builder.addTextBody("targetWiki", wiki);
+        builder.addTextBody("targetSpace", space);
+        builder.addTextBody("strategy", "add");
+        builder.addTextBody("inputSource", "Uploaded file");
+
+        builder.addBinaryBody("file", zipFile, ContentType.DEFAULT_BINARY, zipFile.getName());
+
+        post.setEntity(builder.build());
+
+        HttpResponse resp = client.execute(post);
+        int code = resp.getStatusLine().getStatusCode();
+
+        String body = EntityUtils.toString(resp.getEntity());
+        System.out.println("Response (" + code + "): " + body);
+
+        if (code != 200) {
+            throw new RuntimeException("Import failed: HTTP " + code);
+        }
+
+        System.out.println("Import successful.");
+        client.close();
+    }
+
+    private CloseableHttpClient getClient() {
+        CredentialsProvider provider = new BasicCredentialsProvider();
+        provider.setCredentials(AuthScope.ANY, new UsernamePasswordCredentials(user, pass));
+        return HttpClients.custom().setDefaultCredentialsProvider(provider).build();
+    }
+
+    private String fetchFormToken(CloseableHttpClient client) throws Exception {
+        String url = baseUrl + "/bin/get/XWiki/XWikiLogin?form_token=true";
+        HttpGet get = new HttpGet(url);
+        HttpResponse resp = client.execute(get);
+
+        if (resp.getStatusLine().getStatusCode() != 200)
+            throw new RuntimeException("Cannot fetch form token");
+
+        return EntityUtils.toString(resp.getEntity()).trim();
+    }
+}
