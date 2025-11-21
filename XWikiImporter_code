@@ -1,0 +1,9 @@
+XWikiImporter importer = new XWikiImporter("http://xwiki.example.com", "Admin", "adminpass");
+
+// Option 1: upload the ZIP to XWiki and import
+importer.importZipViaFilterStream(new File("/path/to/confluence-export.zip"), true, Duration.ofHours(2));
+
+// Option 2: use file: reference already accessible by XWiki server (no upload)
+// NOTE: I used your session file path as example per your instruction:
+// file:/mnt/data/17636415221346302215000371163129.jpg
+importer.importZipViaFilterStream(null, false, Duration.ofHours(2)); // replace null/logic in real use
