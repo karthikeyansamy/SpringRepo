@@ -1,0 +1,149 @@
+package com.example.migrator;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.nio.file.*;
+import java.time.Duration;
+import java.time.Instant;
+
+public class MigratorMain {
+
+    private static final Logger logger = LoggerFactory.getLogger(MigratorMain.class);
+
+    // Confluence
+    private static final String CONFLUENCE_BASE_URL = "https://your-confluence.example.com";
+    private static final String CONFLUENCE_USER = "admin";
+    private static final String CONFLUENCE_PASS = "admin";
+
+    // XWiki
+    private static final String XWIKI_BASE_URL = "https://your-xwiki.example.com/xwiki";
+    private static final String XWIKI_USER = "Admin";
+    private static final String XWIKI_PASS = "admin";
+
+    // Server-side copy directory (Option B)
+    private static final String XWIKI_IMPORT_DIR = "/xwiki/migration/";  
+    private static final boolean ENABLE_SCP_COPY = true;  // set false if copying manually
+
+    // File reference that will be passed to XWikiImporter
+    private static final String FILE_REFERENCE_PATTERN = "file:/xwiki/migration/test_space.zip";
+
+    public static void main(String[] args) throws Exception {
+        if (args.length != 1) {
+            System.out.println("Usage: java -jar migrator.jar <SPACE_KEY>");
+            System.exit(1);
+        }
+
+        String spaceKey = args[0];
+        logger.info("=== Starting Migration for Confluence Space: {} ===", spaceKey);
+
+        MigratorMain runner = new MigratorMain();
+        MigrationSummary summary = runner.runMigration(spaceKey);
+
+        logger.info("=== MIGRATION SUMMARY ===\n{}", summary.toPrettyJson());
+
+        if (!summary.result().equals("SUCCESS")) {
+            logger.error("Migration ended with FAILURE. Check logs.");
+            System.exit(2);
+        }
+    }
+
+    public MigrationSummary runMigration(String spaceKey) throws Exception {
+
+        Instant startTime = Instant.now();
+
+        ConfluenceExporter exporter = new ConfluenceExporter(
+                CONFLUENCE_BASE_URL, CONFLUENCE_USER, CONFLUENCE_PASS);
+
+        XWikiImporter importer = new XWikiImporter(
+                XWIKI_BASE_URL, XWIKI_USER, XWIKI_PASS);
+
+        Path downloadedZip = null;
+        Instant exportStart = Instant.now();
+
+        try {
+            // STEP 1: Trigger export
+            String exportJobId = exporter.triggerExport(spaceKey);
+            logger.info("Confluence export started with jobId={}", exportJobId);
+
+            // STEP 2: Wait for export completion
+            Path zipPath = exporter.waitForExportAndDownload(
+                    exportJobId,
+                    Duration.ofMinutes(30),
+                    5
+            );
+
+            downloadedZip = zipPath;
+            Instant exportEnd = Instant.now();
+            logger.info("Export completed. File: {}", downloadedZip);
+
+            // STEP 3: Copy ZIP to XWiki server (via SCP)
+            String serverSidePath = XWIKI_IMPORT_DIR + "test_space.zip";
+
+            if (ENABLE_SCP_COPY) {
+                SCPUploader.copyViaSCP(
+                        downloadedZip.toString(),
+                        "xwiki-ssh-user",
+                        "xwiki-ssh-host",
+                        22,
+                        "/xwiki/migration/test_space.zip"
+                );
+                logger.info("SCP Copy Completed → {}", serverSidePath);
+            } else {
+                logger.warn("SCP is disabled. Ensure ZIP is manually placed at {}", serverSidePath);
+            }
+
+            // STEP 4: Trigger XWiki import
+            String jobId = "confluence_import_" + spaceKey + "_" + System.currentTimeMillis();
+
+            importer.triggerImport(
+                    null, // Option B — no local upload
+                    FILE_REFERENCE_PATTERN, // file:/xwiki/migration/test_space.zip
+                    jobId,
+                    "ImportedSpace.WebHome",
+                    "ImportedSpace",
+                    "replace",
+                    true, true, true, false, false,
+                    "INFO",
+                    false,
+                    false,
+                    true
+            );
+
+            // STEP 5: Poll XWiki job
+            Instant importStart = Instant.now();
+            var finalJson = importer.waitForJobCompletion(jobId, Duration.ofMinutes(30), 5);
+            Instant importEnd = Instant.now();
+
+            logger.info("XWiki Import Completed: {}", finalJson.toPrettyString());
+
+            return new MigrationSummary(
+                    spaceKey,
+                    downloadedZip != null ? downloadedZip.toString() : null,
+                    FILE_REFERENCE_PATTERN,
+                    finalJson.toPrettyString(),
+                    Duration.between(exportStart, exportEnd).toMillis(),
+                    Duration.between(importStart, importEnd).toMillis(),
+                    Duration.between(startTime, Instant.now()).toMillis(),
+                    "SUCCESS",
+                    null
+            );
+
+        } catch (Exception ex) {
+
+            logger.error("Migration failed: {}", ex.getMessage(), ex);
+
+            return new MigrationSummary(
+                    spaceKey,
+                    downloadedZip != null ? downloadedZip.toString() : null,
+                    FILE_REFERENCE_PATTERN,
+                    null,
+                    0,
+                    0,
+                    Duration.between(startTime, Instant.now()).toMillis(),
+                    "FAILED",
+                    ex.getMessage()
+            );
+        }
+    }
+}
