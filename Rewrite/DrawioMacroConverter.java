@@ -1,77 +1,67 @@
-package my.company.confluence.migration;
+package org.xwiki.contrib.confluence.filter.internal.macros;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Map;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
 
 import org.xwiki.component.annotation.Component;
 import org.xwiki.contrib.confluence.filter.Macro;
 import org.xwiki.contrib.confluence.filter.MacroConverter;
 import org.xwiki.filter.FilterException;
 import org.xwiki.filter.Listener;
-import org.xwiki.filter.event.meta.DocumentMetaData;
-import org.xwiki.filter.event.meta.MetaData;
-import org.xwiki.filter.event.xwiki.XWikiMacroBlock;
-import org.xwiki.filter.event.xwiki.XWikiDocumentBlock;
-import org.xwiki.filter.event.xwiki.XWikiRawBlock;
 import org.xwiki.filter.util.FilterContext;
 import org.xwiki.filter.event.model.Attachment;
+import org.xwiki.contrib.confluence.filter.internal.ConfluenceConversionContext;
+import org.xwiki.contrib.confluence.filter.internal.input.ConfluenceInputProperties;
 
-@Component(hint = "drawio")
+@Component
+@Named("drawio")
+@Singleton
 public class DrawioMacroConverter implements MacroConverter
 {
+    @Inject
+    private ConfluenceConversionContext conversionContext;
+
     @Override
     public void convert(Macro macro, Listener listener) throws FilterException
     {
         Map<String, String> parameters = macro.getParameters();
-        String fileName = parameters.get("diagramName");
-        if (fileName == null) {
+        String diagramFile = parameters.get("diagramName");
+        if (diagramFile == null) {
             return;
         }
 
-        String childPageName = fileName.replace(".drawio", "");
+        String childPageName = diagramFile.replace(".drawio", "");
 
-        // ------------------------------------------------------------
-        // 1️⃣ Parent page: emit {{diagram reference="childPageName"/}}
-        // ------------------------------------------------------------
-        listener.onEvent(new XWikiMacroBlock(
-            "diagram",
+        // 1️⃣ Emit diagram reference macro in parent page
+        listener.beginMacro("diagram",
             Collections.singletonMap("reference", childPageName),
-            false
-        ));
+            false);
+        listener.endMacro("diagram");
 
-        // ------------------------------------------------------------
-        // 2️⃣ Load drawio attachment (mxGraphModel XML)
-        // ------------------------------------------------------------
-        byte[] xmlBytes = loadAttachment(fileName, listener);
-        if (xmlBytes == null) {
+        // 2️⃣ Load drawio attachment
+        byte[] drawioXml = loadAttachment(diagramFile, listener);
+        if (drawioXml == null) {
             return;
         }
 
-        String mxGraphXml = new String(xmlBytes, StandardCharsets.UTF_8);
+        String diagramXml = new String(drawioXml, StandardCharsets.UTF_8);
 
-        // ------------------------------------------------------------
-        // 3️⃣ Create child document
-        // ------------------------------------------------------------
-        DocumentMetaData docMeta = new DocumentMetaData();
-        docMeta.setTitle(childPageName);
+        // 3️⃣ Create child page via conversion context
+        this.conversionContext.pushDocument(childPageName);
 
-        listener.onEvent(new XWikiDocumentBlock(childPageName, docMeta));
+        listener.beginMacro("drawio", Collections.emptyMap(), false);
+        listener.onCharacters(diagramXml);
+        listener.endMacro("drawio");
 
-        // ------------------------------------------------------------
-        // 4️⃣ Insert {{drawio}} macro with raw XML
-        // ------------------------------------------------------------
-        listener.onEvent(new XWikiMacroBlock("drawio", Collections.emptyMap(), false));
-        listener.onEvent(new XWikiRawBlock(mxGraphXml));
-        listener.onEvent(XWikiMacroBlock.END);
-
-        // ------------------------------------------------------------
-        // 5️⃣ End child document
-        // ------------------------------------------------------------
-        listener.onEvent(XWikiDocumentBlock.END);
+        this.conversionContext.popDocument();
     }
 
-    private byte[] loadAttachment(String fileName, Listener listener)
+    private byte[] loadAttachment(String name, Listener listener)
     {
         FilterContext context = listener.getContext();
         if (context == null) {
@@ -79,7 +69,7 @@ public class DrawioMacroConverter implements MacroConverter
         }
 
         for (Attachment attachment : context.getAttachments()) {
-            if (fileName.equals(attachment.getName())) {
+            if (name.equals(attachment.getName())) {
                 return attachment.getContent();
             }
         }
