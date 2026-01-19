@@ -1,18 +1,13 @@
-package org.xwiki.contrib.confluence.filter.internal.macros;
+package org.xwiki.contrib.confluence.filter.macros;
 
-import java.util.Collections;
 import java.util.Map;
 
 import javax.inject.Named;
 import javax.inject.Singleton;
 
 import org.xwiki.component.annotation.Component;
-import org.xwiki.contrib.confluence.filter.internal.macros.AbstractMacroConverter;
+import org.xwiki.contrib.confluence.filter.AbstractMacroConverter;
 import org.xwiki.filter.FilterContext;
-import org.xwiki.filter.event.model.FilterEventParameters;
-import org.xwiki.filter.listener.Listener;
-import org.xwiki.filter.type.FilterEventType;
-import org.xwiki.rendering.macro.Macro;
 
 @Component
 @Named("drawio")
@@ -20,22 +15,30 @@ import org.xwiki.rendering.macro.Macro;
 public class DrawioMacroConverter extends AbstractMacroConverter
 {
     @Override
-    public void convert(Macro macro, Listener listener, FilterContext context)
+    protected String toXWikiId(String confluenceId)
     {
-        String diagramName = macro.getParameters().get("diagramName");
+        // Confluence macro name → XWiki macro name
+        return "drawio";
+    }
 
-        listener.beginMacro(
-            "drawio",
-            diagramName != null
-                ? Collections.singletonMap(
-                    "diagram",
-                    diagramName + ".drawio.xml"
-                  )
-                : Collections.emptyMap(),
-            false,
-            FilterEventParameters.EMPTY
-        );
+    @Override
+    protected void toXWikiParameters(
+        Map<String, String> confluenceParameters,
+        Map<String, String> xwikiParameters,
+        FilterContext context)
+    {
+        String diagramName = confluenceParameters.get("diagramName");
 
-        listener.endMacro("drawio", FilterEventParameters.EMPTY);
+        if (diagramName != null && !diagramName.isEmpty()) {
+            // Reference already-imported attachment
+            xwikiParameters.put("diagram", diagramName + ".drawio.xml");
+        }
+    }
+
+    @Override
+    protected boolean supportsInlineMode()
+    {
+        // draw.io is a block macro
+        return false;
     }
 }
